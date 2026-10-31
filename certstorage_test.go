@@ -616,6 +616,18 @@ func TestStore_Find(t *testing.T) {
 		}
 	}
 
+	// When several certificates cover a domain, the one expiring last is returned.
+	expiring := selfSigned(t, "a.example.net", time.Now().Add(24*time.Hour))
+	renewed := selfSigned(t, "b.example.net", time.Now().Add(90*24*time.Hour))
+	store.Put(&certstorage.CertificateRecord{Main: "a.example.net", SANs: []string{"b.example.net"}, Certificate: expiring, Key: "k"})
+	store.Put(&certstorage.CertificateRecord{Main: "b.example.net", SANs: []string{"a.example.net"}, Certificate: renewed, Key: "k"})
+
+	for _, domain := range []string{"a.example.net", "b.example.net"} {
+		if rec := store.Find(domain); rec == nil || rec.Certificate != renewed {
+			t.Errorf("%s: the certificate expiring last should be returned, got: %+v", domain, rec)
+		}
+	}
+
 	if store.Put(&certstorage.CertificateRecord{Main: "example.com", SANs: []string{"api.example.com"}, Certificate: "exact", Key: "k"}) {
 		t.Error("putting an identical certificate should not change the store")
 	}

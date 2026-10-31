@@ -171,6 +171,7 @@ func (s *Store) List() []*CertificateRecord {
 
 // Find returns the certificate covering domain.
 // Exact matches (on the main domain or the SANs) take precedence over wildcard matches.
+// When several certificates match, the one expiring last is returned.
 func (s *Store) Find(domain string) *CertificateRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -178,23 +179,37 @@ func (s *Store) Find(domain string) *CertificateRecord {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	records := s.sortedLocked()
 
-	for _, rec := range records {
-		for _, d := range rec.Domains() {
-			if strings.EqualFold(d, domain) {
-				return rec
-			}
-		}
+	if rec := latest(records, func(d string) bool { return strings.EqualFold(d, domain) }); rec != nil {
+		return rec
 	}
+
+	return latest(records, func(d string) bool { return matchWildcard(strings.ToLower(d), domain) })
+}
+
+// latest returns the record expiring last among the records having a domain matching match.
+// Records are expected to be sorted, the first one wins on ties.
+func latest(records []*CertificateRecord, match func(string) bool) *CertificateRecord {
+	var (
+		best        *CertificateRecord
+		bestExpires time.Time
+	)
 
 	for _, rec := range records {
 		for _, d := range rec.Domains() {
-			if matchWildcard(strings.ToLower(d), domain) {
-				return rec
+			if !match(d) {
+				continue
 			}
+
+			expires := notAfter(rec.Certificate)
+			if best == nil || expires.After(bestExpires) {
+				best, bestExpires = rec, expires
+			}
+
+			break
 		}
 	}
 
-	return nil
+	return best
 }
 
 // ExportedFingerprint returns the fingerprint of the last certificate exported for service.

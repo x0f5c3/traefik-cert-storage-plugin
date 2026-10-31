@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,63 +29,106 @@ func (r *CertificateRecord) Domains() []string {
 	return append([]string{r.Main}, r.SANs...)
 }
 
+const (
+	certificatesPrefix = "certificates/"
+	exportsPrefix      = "exports/"
+)
+
+// exportRecord is the state of the last export made for a service.
+type exportRecord struct {
+	Fingerprint string `json:"fingerprint"`
+}
+
 type storeData struct {
-	Certificates map[string]*CertificateRecord `json:"certificates"`
+	Certificates map[string]*CertificateRecord
 	// Exports maps a service name to the fingerprint of the last certificate exported for it.
-	Exports map[string]string `json:"exports"`
+	Exports map[string]string
 }
 
-// Store is an embedded, file based, certificate store.
-// The whole database is kept in memory and persisted atomically as a JSON document.
+// Store is the certificate store.
+// The content is kept in memory and persisted in a key-value Backend (file, directory, Consul, ...).
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	data  storeData
-	dirty bool
+	mu      sync.Mutex
+	backend Backend
+	data    storeData
+	loaded  bool
+	// dirty contains the keys modified since the last save.
+	dirty map[string]bool
 }
 
-// OpenStore opens (or creates) the store located at path.
-func OpenStore(path string) (*Store, error) {
-	if path == "" {
-		return nil, errors.New("storage path must not be empty")
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("creating storage directory: %w", err)
-	}
-
-	s := &Store{
-		path: path,
+// NewStore creates a store persisted in backend. Load must be called before using the store.
+func NewStore(backend Backend) *Store {
+	return &Store{
+		backend: backend,
 		data: storeData{
 			Certificates: make(map[string]*CertificateRecord),
 			Exports:      make(map[string]string),
 		},
+		dirty: make(map[string]bool),
 	}
+}
 
-	raw, err := os.ReadFile(filepath.Clean(path))
+// OpenStore opens (or creates) the store persisted in the JSON file located at path.
+func OpenStore(path string) (*Store, error) {
+	backend, err := NewFileBackend(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
-		return nil, fmt.Errorf("reading storage: %w", err)
+		return nil, err
 	}
 
-	if len(raw) == 0 {
-		return s, nil
-	}
-
-	if err := json.Unmarshal(raw, &s.data); err != nil {
-		return nil, fmt.Errorf("decoding storage %s: %w", path, err)
-	}
-
-	if s.data.Certificates == nil {
-		s.data.Certificates = make(map[string]*CertificateRecord)
-	}
-	if s.data.Exports == nil {
-		s.data.Exports = make(map[string]string)
+	s := NewStore(backend)
+	if err := s.Load(); err != nil {
+		return nil, err
 	}
 
 	return s, nil
+}
+
+// Loaded reports whether the store content has been loaded from the backend.
+func (s *Store) Loaded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.loaded
+}
+
+// Load loads the store content from the backend.
+func (s *Store) Load() error {
+	entries, err := s.backend.Load()
+	if err != nil {
+		return fmt.Errorf("loading storage: %w", err)
+	}
+
+	data := storeData{
+		Certificates: make(map[string]*CertificateRecord),
+		Exports:      make(map[string]string),
+	}
+
+	for key, value := range entries {
+		switch {
+		case strings.HasPrefix(key, certificatesPrefix):
+			rec := &CertificateRecord{}
+			if err := json.Unmarshal(value, rec); err != nil {
+				return fmt.Errorf("decoding %s: %w", key, err)
+			}
+			data.Certificates[strings.TrimPrefix(key, certificatesPrefix)] = rec
+
+		case strings.HasPrefix(key, exportsPrefix):
+			exp := &exportRecord{}
+			if err := json.Unmarshal(value, exp); err != nil {
+				return fmt.Errorf("decoding %s: %w", key, err)
+			}
+			data.Exports[strings.TrimPrefix(key, exportsPrefix)] = exp.Fingerprint
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = data
+	s.dirty = make(map[string]bool)
+	s.loaded = true
+
+	return nil
 }
 
 // Put inserts or updates a certificate. It returns true if the store content changed.
@@ -106,7 +148,7 @@ func (s *Store) Put(rec *CertificateRecord) bool {
 
 	rec.UpdatedAt = time.Now().UTC()
 	s.data.Certificates[key] = rec
-	s.dirty = true
+	s.dirty[certificatesPrefix+key] = true
 
 	return true
 }
@@ -173,28 +215,41 @@ func (s *Store) SetExportedFingerprint(service, fp string) {
 	}
 
 	s.data.Exports[service] = fp
-	s.dirty = true
+	s.dirty[exportsPrefix+service] = true
 }
 
-// Save persists the store if it has been modified.
+// Save persists the entries modified since the last save.
 func (s *Store) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.dirty {
+	if len(s.dirty) == 0 {
 		return nil
 	}
 
-	raw, err := json.MarshalIndent(s.data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encoding storage: %w", err)
+	entries := make(map[string][]byte, len(s.dirty))
+	for key := range s.dirty {
+		// The values are marshaled with their concrete types: Yaegi does not marshal interpreted types wrapped in interface{}.
+		var (
+			raw []byte
+			err error
+		)
+		if strings.HasPrefix(key, certificatesPrefix) {
+			raw, err = json.Marshal(s.data.Certificates[strings.TrimPrefix(key, certificatesPrefix)])
+		} else {
+			raw, err = json.Marshal(&exportRecord{Fingerprint: s.data.Exports[strings.TrimPrefix(key, exportsPrefix)]})
+		}
+		if err != nil {
+			return fmt.Errorf("encoding %s: %w", key, err)
+		}
+		entries[key] = raw
 	}
 
-	if err := writeFileAtomic(s.path, raw, 0o600); err != nil {
+	if err := s.backend.Store(entries); err != nil {
 		return fmt.Errorf("writing storage: %w", err)
 	}
 
-	s.dirty = false
+	s.dirty = make(map[string]bool)
 
 	return nil
 }

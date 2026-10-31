@@ -9,5 +9,7 @@ summary: 'Persists certificates in an embedded store, exports them to the servic
 
 testData:
   pollInterval: 10s
-  storagePath: /tmp/certstorage/certstorage.json
+  storage:
+    type: file
+    path: /tmp/certstorage/certstorage.json
   acmeStorage: /tmp/certstorage/acme.json

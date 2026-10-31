@@ -23,6 +23,15 @@ const (
 	defaultSignal   = "SIGHUP"
 )
 
+// Export formats.
+const (
+	// FormatPEM writes the certificate chain to certFile and the private key to keyFile.
+	FormatPEM = "pem"
+	// FormatLetsEncrypt writes the files the way Let's Encrypt clients (certbot) do:
+	// cert.pem, chain.pem, fullchain.pem, and privkey.pem.
+	FormatLetsEncrypt = "letsencrypt"
+)
+
 // ServiceConfig describes a service requesting a certificate.
 type ServiceConfig struct {
 	// Name identifies the service.
@@ -31,9 +40,11 @@ type ServiceConfig struct {
 	Domain string `json:"domain,omitempty"`
 	// Path is the directory (e.g. a volume shared with the service) where the certificate is written.
 	Path string `json:"path,omitempty"`
-	// CertFile is the certificate file name, relative to Path (default: cert.pem).
+	// Format is the export format: pem (default) or letsencrypt.
+	Format string `json:"format,omitempty"`
+	// CertFile is the certificate file name, relative to Path (pem format, default: cert.pem).
 	CertFile string `json:"certFile,omitempty"`
-	// KeyFile is the private key file name, relative to Path (default: key.pem).
+	// KeyFile is the private key file name, relative to Path (pem format, default: key.pem).
 	KeyFile string `json:"keyFile,omitempty"`
 	// Container is the name or ID of the container to signal when the certificate is written (optional).
 	Container string `json:"container,omitempty"`
@@ -45,8 +56,8 @@ type ServiceConfig struct {
 type Config struct {
 	// PollInterval is the interval between two synchronizations.
 	PollInterval string `json:"pollInterval,omitempty"`
-	// StoragePath is the path of the embedded certificate store.
-	StoragePath string `json:"storagePath,omitempty"`
+	// Storage is the certificate store backend.
+	Storage StorageConfig `json:"storage,omitempty"`
 	// ACMEStorage is the path of Traefik's ACME storage file (acme.json) used as certificate source (optional).
 	ACMEStorage string `json:"acmeStorage,omitempty"`
 	// Resolvers restricts the ACME resolvers whose certificates are imported (default: all).
@@ -62,8 +73,11 @@ type Config struct {
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		PollInterval:   "10s",
-		StoragePath:    "/data/certstorage.json",
+		PollInterval: "10s",
+		Storage: StorageConfig{
+			Type: StorageFile,
+			Path: "/data/certstorage.json",
+		},
 		DockerEndpoint: DefaultDockerEndpoint,
 	}
 }
@@ -103,6 +117,9 @@ func New(_ context.Context, config *Config, name string) (*Provider, error) {
 		if svc.KeyFile == "" {
 			svc.KeyFile = defaultKeyFile
 		}
+		if svc.Format == "" {
+			svc.Format = FormatPEM
+		}
 		if svc.Signal == "" {
 			svc.Signal = defaultSignal
 		}
@@ -128,11 +145,11 @@ func (p *Provider) Init() error {
 		return err
 	}
 
-	store, err := OpenStore(p.config.StoragePath)
+	backend, err := NewBackend(p.config.Storage)
 	if err != nil {
 		return err
 	}
-	p.store = store
+	p.store = NewStore(backend)
 
 	for _, svc := range p.services {
 		if svc.Container == "" {
@@ -167,8 +184,14 @@ func (p *Provider) validateServices() error {
 		if svc.Path == "" {
 			return fmt.Errorf("service %q: path is required", svc.Name)
 		}
-		if svc.CertFile == svc.KeyFile {
-			return fmt.Errorf("service %q: certFile and keyFile must be different", svc.Name)
+		switch svc.Format {
+		case FormatPEM:
+			if svc.CertFile == svc.KeyFile {
+				return fmt.Errorf("service %q: certFile and keyFile must be different", svc.Name)
+			}
+		case FormatLetsEncrypt:
+		default:
+			return fmt.Errorf("service %q: unsupported format %q", svc.Name, svc.Format)
 		}
 	}
 
@@ -219,6 +242,15 @@ func (p *Provider) loadConfiguration(ctx context.Context, cfgChan chan<- json.Ma
 // sync imports the certificates from the sources, exports them to the services,
 // and sends the dynamic configuration when the stored certificates changed.
 func (p *Provider) sync(ctx context.Context, cfgChan chan<- json.Marshaler, force bool) {
+	// The store is loaded lazily, so a remote backend that is not reachable yet does not prevent the plugin from starting.
+	if !p.store.Loaded() {
+		if err := p.store.Load(); err != nil {
+			p.logger.Printf("Unable to load the certificate store: %v", err)
+			return
+		}
+		force = true
+	}
+
 	changed := p.importCertificates()
 
 	p.exportCertificates(ctx)
@@ -277,10 +309,9 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 		return nil
 	}
 
-	certPath := filepath.Join(svc.Path, svc.CertFile)
-	keyPath := filepath.Join(svc.Path, svc.KeyFile)
+	files := exportFiles(svc, rec)
 
-	if p.store.ExportedFingerprint(svc.Name) == rec.Fingerprint && fileExists(certPath) && fileExists(keyPath) {
+	if p.store.ExportedFingerprint(svc.Name) == rec.Fingerprint && filesExist(svc.Path, files) {
 		return nil
 	}
 
@@ -289,12 +320,10 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
-	if err := writeFileAtomic(keyPath, []byte(rec.Key), 0o600); err != nil {
-		return fmt.Errorf("writing key: %w", err)
-	}
-
-	if err := writeFileAtomic(certPath, []byte(rec.Certificate), 0o644); err != nil {
-		return fmt.Errorf("writing certificate: %w", err)
+	for _, file := range files {
+		if err := writeFileAtomic(filepath.Join(svc.Path, file.name), []byte(file.content), file.perm); err != nil {
+			return fmt.Errorf("writing %s: %w", file.name, err)
+		}
 	}
 
 	p.logger.Printf("Certificate for %s exported to %s", svc.Domain, svc.Path)
@@ -364,7 +393,12 @@ func (p *Provider) generateConfiguration() *dynamic.Configuration {
 	return configuration
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func filesExist(dir string, files []exportFile) bool {
+	for _, file := range files {
+		if _, err := os.Stat(filepath.Join(dir, file.name)); err != nil {
+			return false
+		}
+	}
+
+	return true
 }

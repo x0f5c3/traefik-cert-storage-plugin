@@ -256,7 +256,7 @@ func TestProvider_ExportAndRenewal(t *testing.T) {
 
 	config := certstorage.CreateConfig()
 	config.PollInterval = "50ms"
-	config.StoragePath = storagePath
+	config.Storage.Path = storagePath
 	config.ACMEStorage = acmePath
 	config.PublishCertificates = true
 	config.DockerEndpoint = endpoint
@@ -307,7 +307,7 @@ func assertPersisted(t *testing.T, config *certstorage.Config, requests chan sig
 		t.Fatal(err)
 	}
 
-	store, err := certstorage.OpenStore(config.StoragePath)
+	store, err := certstorage.OpenStore(config.Storage.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestProvider_RetryFailedSignal(t *testing.T) {
 
 	config := certstorage.CreateConfig()
 	config.PollInterval = "50ms"
-	config.StoragePath = filepath.Join(dir, "certstorage.json")
+	config.Storage.Path = filepath.Join(dir, "certstorage.json")
 	config.ACMEStorage = acmePath
 	config.DockerEndpoint = endpoint
 	config.Services = []certstorage.ServiceConfig{
@@ -382,7 +382,7 @@ func TestProvider_SameDomainSeveralResolvers(t *testing.T) {
 
 	config := certstorage.CreateConfig()
 	config.PollInterval = "50ms"
-	config.StoragePath = filepath.Join(dir, "certstorage.json")
+	config.Storage.Path = filepath.Join(dir, "certstorage.json")
 	config.ACMEStorage = acmePath
 
 	provider, cfgChan := startProvider(t, config)
@@ -402,7 +402,7 @@ func TestProvider_SameDomainSeveralResolvers(t *testing.T) {
 	default:
 	}
 
-	store, err := certstorage.OpenStore(config.StoragePath)
+	store, err := certstorage.OpenStore(config.Storage.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +422,7 @@ func TestProvider_ReexportMissingFiles(t *testing.T) {
 
 	config := certstorage.CreateConfig()
 	config.PollInterval = "50ms"
-	config.StoragePath = filepath.Join(dir, "certstorage.json")
+	config.Storage.Path = filepath.Join(dir, "certstorage.json")
 	config.ACMEStorage = acmePath
 	config.Services = []certstorage.ServiceConfig{
 		{Name: "web", Domain: "example.com", Path: volume, CertFile: "tls.crt", KeyFile: "tls.key"},
@@ -462,7 +462,9 @@ func TestProvider_Init(t *testing.T) {
 		services []certstorage.ServiceConfig
 		endpoint string
 		storage  string
-		wantErr  bool
+		// storageType is the storage backend type, endpoint is then the storage endpoint.
+		storageType string
+		wantErr     bool
 	}{
 		{
 			desc:    "no services",
@@ -509,6 +511,43 @@ func TestProvider_Init(t *testing.T) {
 			wantErr:  true,
 		},
 		{
+			desc:     "unsupported format",
+			storage:  filepath.Join(dir, "h.json"),
+			services: []certstorage.ServiceConfig{{Name: "a", Domain: "example.com", Path: dir, Format: "pkcs12"}},
+			wantErr:  true,
+		},
+		{
+			desc:     "letsencrypt format",
+			storage:  filepath.Join(dir, "i.json"),
+			services: []certstorage.ServiceConfig{{Name: "a", Domain: "example.com", Path: dir, Format: "letsencrypt"}},
+		},
+		{
+			desc:        "unsupported storage type",
+			storage:     filepath.Join(dir, "j.json"),
+			storageType: "bolt",
+			wantErr:     true,
+		},
+		{
+			desc:        "invalid consul endpoint",
+			storageType: "consul",
+			endpoint:    "consul:8500",
+			wantErr:     true,
+		},
+		{
+			desc:        "consul",
+			storageType: "consul",
+		},
+		{
+			desc:        "directory",
+			storage:     filepath.Join(dir, "k"),
+			storageType: "directory",
+		},
+		{
+			desc:        "missing directory path",
+			storageType: "directory",
+			wantErr:     true,
+		},
+		{
 			desc:    "missing storage path",
 			wantErr: true,
 		},
@@ -518,9 +557,13 @@ func TestProvider_Init(t *testing.T) {
 		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			config := certstorage.CreateConfig()
-			config.StoragePath = test.storage
+			config.Storage.Path = test.storage
 			config.Services = test.services
-			if test.endpoint != "" {
+			switch {
+			case test.storageType != "":
+				config.Storage.Type = test.storageType
+				config.Storage.Endpoint = test.endpoint
+			case test.endpoint != "":
 				config.DockerEndpoint = test.endpoint
 			}
 

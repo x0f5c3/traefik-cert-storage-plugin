@@ -4,9 +4,10 @@
 
 A [Traefik](https://traefik.io) provider plugin that:
 
-1. **Stores certificates** in an embedded, file based store (a single JSON document written atomically, no external database needed).
+1. **Stores certificates** in a pluggable storage backend: a single JSON file (default), a directory (one file per entry), or [Consul KV](https://developer.hashicorp.com/consul/docs/dynamic-app-config/kv).
    Certificates are imported from Traefik's ACME storage (`acme.json`) on every poll, so every issuance and renewal is persisted.
-2. **Exports certificates to the services requesting them**, e.g. by writing the certificate and private key into a volume shared with the service's container.
+2. **Exports certificates to the services requesting them**, e.g. by writing the certificate and private key into a volume shared with the service's container,
+   either as a simple certificate/key pair or in the same layout as Let's Encrypt clients (`cert.pem`, `chain.pem`, `fullchain.pem`, `privkey.pem`).
    Every time the certificate is renewed, the files are updated the same way (they are also re-written if they disappear).
 3. **Signals the service's container** (optional): after the files are written, a signal (default `SIGHUP`) is sent to the container through the Docker Engine API so that the service can reload its certificate.
 4. Optionally **publishes the stored certificates** in Traefik's dynamic TLS configuration (`publishCertificates: true`).
@@ -37,8 +38,10 @@ providers:
     certstorage:
       # Interval between two synchronizations (default: 10s).
       pollInterval: 30s
-      # Path of the embedded certificate store (default: /data/certstorage.json).
-      storagePath: /data/certstorage.json
+      # Certificate store backend (see "Storage backends" below).
+      storage:
+        type: file
+        path: /data/certstorage.json
       # Traefik's ACME storage used as certificate source (optional).
       acmeStorage: /letsencrypt/acme.json
       # Only import the certificates of these resolvers (optional, default: all).
@@ -56,7 +59,9 @@ providers:
           domain: mail.example.com
           # Directory where the certificate is written (e.g. a volume shared with the service).
           path: /exports/mail
-          # File names, relative to path (defaults: cert.pem and key.pem).
+          # Export format: pem (default) or letsencrypt (see "Export formats" below).
+          format: pem
+          # File names, relative to path (pem format only, defaults: cert.pem and key.pem).
           certFile: fullchain.pem
           keyFile: privkey.pem
           # Container (name or ID) to signal when the certificate is written (optional).
@@ -65,10 +70,51 @@ providers:
           signal: SIGHUP
 ```
 
+### Storage backends
+
+| `storage.type`   | Options                                                                                                     | Description                                                                                                                                         |
+|------------------|-------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `file` (default) | `path`: JSON file (default: `/data/certstorage.json`)                                                       | All entries in a single JSON document, written atomically.                                                                                          |
+| `directory`      | `path`: directory                                                                                           | One JSON file per entry (`certificates/<domain>.json`, `exports/<service>.json`), each written atomically. Easy to inspect, back up, or sync.        |
+| `consul`         | `endpoint` (default: `http://127.0.0.1:8500`), `prefix` (default: `traefik-certstorage`), `token` (optional) | Entries are stored in the Consul KV store (`<prefix>/certificates/<domain>`, `<prefix>/exports/<service>`), so several Traefik instances can share them. |
+
+```yaml
+providers:
+  plugin:
+    certstorage:
+      storage:
+        type: consul
+        endpoint: http://consul:8500
+        prefix: traefik-certstorage
+        token: my-acl-token
+```
+
+The store is loaded on the first successful poll: if a remote backend is not reachable when Traefik starts, the plugin retries on every poll.
+Files written by the `file` and `directory` backends have `0600` permissions as they contain private keys.
+
+New backends can be added by implementing the `Backend` interface (`Load() (map[string][]byte, error)` and `Store(entries map[string][]byte) error`).
+
+### Export formats
+
+| `format`        | Files written in `path`                                                                                                                                                                                                                         |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `pem` (default) | `certFile` (default `cert.pem`): the certificate chain as stored by Traefik; `keyFile` (default `key.pem`): the private key.                                                                                                                     |
+| `letsencrypt`   | The same files as Let's Encrypt clients (certbot `live/<domain>/` directory): `cert.pem` (leaf certificate), `chain.pem` (intermediate certificates), `fullchain.pem` (leaf + intermediates), and `privkey.pem` (private key in PKCS#8 format). |
+
+Services expecting certbot's layout can mount the volume so `path` matches their expected `/etc/letsencrypt/live/<domain>` directory, for example:
+
+```yaml
+      services:
+        - name: mail
+          domain: mail.example.com
+          path: /exports/mail/live/mail.example.com
+          format: letsencrypt
+          container: mailserver
+```
+
 Notes:
 
-- The certificate file contains the PEM certificate chain as stored by Traefik, and is written with `0644` permissions; the private key is written with `0600` permissions.
-  The store itself is written with `0600` permissions as it contains private keys.
+- Certificates are written with `0644` permissions, private keys with `0600` permissions.
 - A service is exported (and its container signaled) only when its certificate changed since the last export (the fingerprint of the last exported certificate is persisted in the store), or when the exported files are missing.
 - The certificates stay in the store even if they disappear from the ACME storage.
 - Signaling containers requires access to the Docker Engine API, e.g. by mounting `/var/run/docker.sock` into the Traefik container.

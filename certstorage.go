@@ -186,7 +186,7 @@ func (p *Provider) validateServices() error {
 		}
 		switch svc.Format {
 		case FormatPEM:
-			if svc.CertFile == svc.KeyFile {
+			if filepath.Join(svc.Path, svc.CertFile) == filepath.Join(svc.Path, svc.KeyFile) {
 				return fmt.Errorf("service %q: certFile and keyFile must be different", svc.Name)
 			}
 		case FormatLetsEncrypt:
@@ -315,13 +315,20 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 		return nil
 	}
 
+	// Keep this export pending until the files are written and signaling succeeds.
+	p.store.SetExportedFingerprint(svc.Name, "")
+
 	// The directory must be readable by the service, which may run as a different user.
 	if err := os.MkdirAll(svc.Path, 0o755); err != nil { //nolint:gosec // See above.
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
 	for _, file := range files {
-		if err := writeFileAtomic(filepath.Join(svc.Path, file.name), []byte(file.content), file.perm); err != nil {
+		path := filepath.Join(svc.Path, file.name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // Export directories must be readable by the service.
+			return fmt.Errorf("creating directory for %s: %w", file.name, err)
+		}
+		if err := writeFileAtomic(path, []byte(file.content), file.perm); err != nil {
 			return fmt.Errorf("writing %s: %w", file.name, err)
 		}
 	}
@@ -395,7 +402,8 @@ func (p *Provider) generateConfiguration() *dynamic.Configuration {
 
 func filesExist(dir string, files []exportFile) bool {
 	for _, file := range files {
-		if _, err := os.Stat(filepath.Join(dir, file.name)); err != nil {
+		content, err := os.ReadFile(filepath.Join(dir, file.name))
+		if err != nil || string(content) != file.content {
 			return false
 		}
 	}

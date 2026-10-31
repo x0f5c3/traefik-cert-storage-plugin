@@ -25,30 +25,22 @@ func newDockerClient(endpoint string) (*dockerClient, error) {
 		endpoint = DefaultDockerEndpoint
 	}
 
+	// The socket path is not parsed as a URL: it may be a Windows path (unix://C:\...\docker.sock).
+	if strings.HasPrefix(endpoint, "unix://") {
+		socket := strings.TrimPrefix(endpoint, "unix://")
+		if socket == "" {
+			return nil, fmt.Errorf("invalid docker endpoint %q: missing socket path", endpoint)
+		}
+
+		return newUnixDockerClient(socket), nil
+	}
+
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("invalid docker endpoint %q: %w", endpoint, err)
 	}
 
 	switch u.Scheme {
-	case "unix":
-		socket := u.Path
-		if socket == "" {
-			return nil, fmt.Errorf("invalid docker endpoint %q: missing socket path", endpoint)
-		}
-
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
-		transport := &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "unix", socket)
-			},
-		}
-
-		return &dockerClient{
-			baseURL: "http://docker",
-			client:  &http.Client{Transport: transport, Timeout: 30 * time.Second},
-		}, nil
-
 	case "tcp", "http":
 		return &dockerClient{
 			baseURL: "http://" + u.Host,
@@ -63,6 +55,20 @@ func newDockerClient(endpoint string) (*dockerClient, error) {
 
 	default:
 		return nil, fmt.Errorf("invalid docker endpoint %q: unsupported scheme %q", endpoint, u.Scheme)
+	}
+}
+
+func newUnixDockerClient(socket string) *dockerClient {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", socket)
+		},
+	}
+
+	return &dockerClient{
+		baseURL: "http://docker",
+		client:  &http.Client{Transport: transport, Timeout: 30 * time.Second},
 	}
 }
 

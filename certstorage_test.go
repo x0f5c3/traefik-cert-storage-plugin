@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -226,7 +227,8 @@ func assertFile(t *testing.T, path, expected string, perm os.FileMode) {
 		t.Fatal(err)
 	}
 
-	if info.Mode().Perm() != perm {
+	// Windows does not support Unix permissions.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != perm {
 		t.Errorf("%s: got permissions %v, want %v", path, info.Mode().Perm(), perm)
 	}
 }

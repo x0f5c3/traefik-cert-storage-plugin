@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -226,7 +227,7 @@ func TestDirectoryBackend_Layout(t *testing.T) {
 			return err
 		}
 
-		if info.Mode().Perm() != 0o600 {
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 			t.Errorf("%s: got permissions %v, want 0600", rel, info.Mode().Perm())
 		}
 
@@ -352,7 +353,7 @@ func TestProvider_LetsEncryptFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Errorf("privkey.pem: got permissions %v, want 0600", info.Mode().Perm())
 	}
 }

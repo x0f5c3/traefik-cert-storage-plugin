@@ -243,15 +243,25 @@ func (p *Provider) loadConfiguration(ctx context.Context, cfgChan chan<- json.Ma
 // and sends the dynamic configuration when the stored certificates changed.
 func (p *Provider) sync(ctx context.Context, cfgChan chan<- json.Marshaler, force bool) {
 	// The store is loaded lazily, so a remote backend that is not reachable yet does not prevent the plugin from starting.
+	var changed bool
 	if !p.store.Loaded() {
 		if err := p.store.Load(); err != nil {
 			p.logger.Printf("Unable to load the certificate store: %v", err)
 			return
 		}
 		force = true
+	} else {
+		remoteChanged, err := p.store.Refresh()
+		if err != nil {
+			p.logger.Printf("Unable to refresh the certificate store: %v", err)
+		} else if remoteChanged {
+			changed = true
+		}
 	}
 
-	changed := p.importCertificates()
+	if p.importCertificates() {
+		changed = true
+	}
 
 	p.exportCertificates(ctx)
 

@@ -295,6 +295,118 @@ func TestProvider_ConsulStorage(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "volume", "cert.pem"), certV1, 0o644)
 }
 
+func TestStore_RefreshPreservesDirtyEntries(t *testing.T) {
+	_, consulURL := startFakeConsul(t, "", 0)
+	backend, err := certstorage.NewBackend(certstorage.StorageConfig{Type: "consul", Endpoint: consulURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := certstorage.NewStore(backend)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: certV1, Key: keyV1})
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteBackend, err := certstorage.NewBackend(certstorage.StorageConfig{Type: "consul", Endpoint: consulURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteStore := certstorage.NewStore(remoteBackend)
+	if err := remoteStore.Load(); err != nil {
+		t.Fatal(err)
+	}
+	remoteStore.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: certV2, Key: keyV2})
+	remoteStore.Put(&certstorage.CertificateRecord{Main: "remote.example.com", Certificate: certV2, Key: keyV2})
+	if err := remoteStore.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	store.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: "local pending", Key: keyV2})
+	changed, err := store.Refresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("refresh should report a remote certificate change")
+	}
+	if rec := store.Get("example.com"); rec == nil || rec.Certificate != "local pending" {
+		t.Errorf("refresh discarded a pending local write: %+v", rec)
+	}
+	if rec := store.Get("remote.example.com"); rec == nil || rec.Certificate != certV2 {
+		t.Errorf("refresh did not merge a remote certificate: %+v", rec)
+	}
+
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := certstorage.NewStore(backend)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if rec := reloaded.Get("example.com"); rec == nil || rec.Certificate != "local pending" {
+		t.Errorf("pending local write was not persisted after refresh: %+v", rec)
+	}
+}
+
+func TestProvider_RefreshesRemoteCertificates(t *testing.T) {
+	dir := t.TempDir()
+	_, consulURL := startFakeConsul(t, "", 0)
+
+	backend, err := certstorage.NewBackend(certstorage.StorageConfig{Type: "consul", Endpoint: consulURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := certstorage.NewStore(backend)
+	if err := seed.Load(); err != nil {
+		t.Fatal(err)
+	}
+	seed.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: certV1, Key: keyV1})
+	if err := seed.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	config := certstorage.CreateConfig()
+	config.PollInterval = "50ms"
+	config.Storage = certstorage.StorageConfig{Type: "consul", Endpoint: consulURL}
+	config.PublishCertificates = true
+	config.Services = []certstorage.ServiceConfig{
+		{Name: "web", Domain: "example.com", Path: filepath.Join(dir, "volume")},
+	}
+
+	provider, cfgChan := startProvider(t, config)
+	t.Cleanup(func() { _ = provider.Stop() })
+	waitConfig(t, cfgChan)
+	assertFile(t, filepath.Join(dir, "volume", "cert.pem"), certV1, 0o644)
+
+	updateBackend, err := certstorage.NewBackend(certstorage.StorageConfig{Type: "consul", Endpoint: consulURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := certstorage.NewStore(updateBackend)
+	if err := update.Load(); err != nil {
+		t.Fatal(err)
+	}
+	update.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: certV2, Key: keyV2})
+	if err := update.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := waitConfig(t, cfgChan)
+	certificates := publishedCertificates(t, cfg)
+	if len(certificates) != 1 {
+		t.Fatalf("got %d published certificates, want 1", len(certificates))
+	}
+	published, ok := certificates[0].(map[string]interface{})
+	if !ok || published["certFile"] != strings.TrimSpace(certV2) {
+		t.Fatalf("published configuration did not contain the remote certificate update: %v", certificates[0])
+	}
+	assertFile(t, filepath.Join(dir, "volume", "cert.pem"), certV2, 0o644)
+}
+
 func TestProvider_LetsEncryptFormat(t *testing.T) {
 	dir := t.TempDir()
 	acmePath := filepath.Join(dir, "acme.json")

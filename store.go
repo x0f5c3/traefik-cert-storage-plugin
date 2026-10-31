@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -93,9 +94,83 @@ func (s *Store) Loaded() bool {
 
 // Load loads the store content from the backend.
 func (s *Store) Load() error {
+	data, err := s.loadData()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = data
+	s.dirty = make(map[string]bool)
+	s.loaded = true
+
+	return nil
+}
+
+// Refresh merges the latest backend content without discarding local writes.
+// It returns true when the certificate records changed.
+func (s *Store) Refresh() (bool, error) {
+	data, err := s.loadData()
+	if err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := false
+	for key, current := range s.data.Certificates {
+		if s.dirty[certificatesPrefix+key] {
+			continue
+		}
+
+		remote, ok := data.Certificates[key]
+		if !ok {
+			delete(s.data.Certificates, key)
+			changed = true
+			continue
+		}
+
+		if !reflect.DeepEqual(current, remote) {
+			changed = true
+		}
+		s.data.Certificates[key] = remote
+	}
+	for key, remote := range data.Certificates {
+		if s.dirty[certificatesPrefix+key] {
+			continue
+		}
+		if _, ok := s.data.Certificates[key]; !ok {
+			s.data.Certificates[key] = remote
+			changed = true
+		}
+	}
+
+	for key := range s.data.Exports {
+		if s.dirty[exportsPrefix+key] {
+			continue
+		}
+		if remote, ok := data.Exports[key]; ok {
+			s.data.Exports[key] = remote
+		} else {
+			delete(s.data.Exports, key)
+		}
+	}
+	for key, remote := range data.Exports {
+		if !s.dirty[exportsPrefix+key] {
+			s.data.Exports[key] = remote
+		}
+	}
+
+	return changed, nil
+}
+
+func (s *Store) loadData() (storeData, error) {
 	entries, err := s.backend.Load()
 	if err != nil {
-		return fmt.Errorf("loading storage: %w", err)
+		return storeData{}, fmt.Errorf("loading storage: %w", err)
 	}
 
 	data := storeData{
@@ -108,27 +183,20 @@ func (s *Store) Load() error {
 		case strings.HasPrefix(key, certificatesPrefix):
 			rec := &CertificateRecord{}
 			if err := json.Unmarshal(value, rec); err != nil {
-				return fmt.Errorf("decoding %s: %w", key, err)
+				return storeData{}, fmt.Errorf("decoding %s: %w", key, err)
 			}
 			data.Certificates[strings.TrimPrefix(key, certificatesPrefix)] = rec
 
 		case strings.HasPrefix(key, exportsPrefix):
 			exp := &exportRecord{}
 			if err := json.Unmarshal(value, exp); err != nil {
-				return fmt.Errorf("decoding %s: %w", key, err)
+				return storeData{}, fmt.Errorf("decoding %s: %w", key, err)
 			}
 			data.Exports[strings.TrimPrefix(key, exportsPrefix)] = exp.Fingerprint
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.data = data
-	s.dirty = make(map[string]bool)
-	s.loaded = true
-
-	return nil
+	return data, nil
 }
 
 // Put inserts or updates a certificate. It returns true if the store content changed.

@@ -2,12 +2,20 @@ package certstorage_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,21 +35,24 @@ type signalRequest struct {
 	signal string
 }
 
-func writeACME(t *testing.T, path, cert, key string) {
+func acmeEntry(main string, sans []string, cert, key string) map[string]interface{} {
+	return map[string]interface{}{
+		"domain":      map[string]interface{}{"main": main, "sans": sans},
+		"certificate": base64.StdEncoding.EncodeToString([]byte(cert)),
+		"key":         base64.StdEncoding.EncodeToString([]byte(key)),
+		"Store":       "default",
+	}
+}
+
+func writeACMEContent(t *testing.T, path string, resolvers map[string][]interface{}) {
 	t.Helper()
 
-	content := map[string]interface{}{
-		"le": map[string]interface{}{
-			"Account": map[string]interface{}{"Email": "admin@example.com"},
-			"Certificates": []interface{}{
-				map[string]interface{}{
-					"domain":      map[string]interface{}{"main": "example.com", "sans": []string{"www.example.com"}},
-					"certificate": base64.StdEncoding.EncodeToString([]byte(cert)),
-					"key":         base64.StdEncoding.EncodeToString([]byte(key)),
-					"Store":       "default",
-				},
-			},
-		},
+	content := make(map[string]interface{})
+	for name, certs := range resolvers {
+		content[name] = map[string]interface{}{
+			"Account":      map[string]interface{}{"Email": "admin@example.com"},
+			"Certificates": certs,
+		}
 	}
 
 	raw, err := json.Marshal(content)
@@ -54,7 +65,46 @@ func writeACME(t *testing.T, path, cert, key string) {
 	}
 }
 
+func writeACME(t *testing.T, path, cert, key string) {
+	t.Helper()
+
+	writeACMEContent(t, path, map[string][]interface{}{
+		"le": {acmeEntry("example.com", []string{"www.example.com"}, cert, key)},
+	})
+}
+
+func selfSigned(t *testing.T, domain string, notAfter time.Time) string {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     notAfter,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
 func startFakeDocker(t *testing.T) (string, chan signalRequest) {
+	t.Helper()
+
+	return startFakeDockerFailing(t, 0)
+}
+
+// startFakeDockerFailing starts a fake Docker Engine API failing the first failures requests.
+func startFakeDockerFailing(t *testing.T, failures int) (string, chan signalRequest) {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "cs")
@@ -71,10 +121,22 @@ func startFakeDocker(t *testing.T) (string, chan signalRequest) {
 
 	requests := make(chan signalRequest, 10)
 
+	var mu sync.Mutex
+
 	server := &http.Server{
 		ReadHeaderTimeout: time.Second,
 		Handler: http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 			requests <- signalRequest{method: req.Method, path: req.URL.Path, signal: req.URL.Query().Get("signal")}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if failures > 0 {
+				failures--
+				http.Error(rw, "container is restarting", http.StatusConflict)
+				return
+			}
+
 			rw.WriteHeader(http.StatusNoContent)
 		}),
 	}
@@ -270,6 +332,84 @@ func assertPersisted(t *testing.T, config *certstorage.Config, requests chan sig
 	case req := <-requests:
 		t.Errorf("unexpected signal request: %+v", req)
 	default:
+	}
+}
+
+func TestProvider_RetryFailedSignal(t *testing.T) {
+	dir := t.TempDir()
+	acmePath := filepath.Join(dir, "acme.json")
+
+	writeACME(t, acmePath, certV1, keyV1)
+
+	endpoint, requests := startFakeDockerFailing(t, 1)
+
+	config := certstorage.CreateConfig()
+	config.PollInterval = "50ms"
+	config.StoragePath = filepath.Join(dir, "certstorage.json")
+	config.ACMEStorage = acmePath
+	config.DockerEndpoint = endpoint
+	config.Services = []certstorage.ServiceConfig{
+		{Name: "web", Domain: "example.com", Path: filepath.Join(dir, "volume"), Container: "web-1", Signal: "SIGUSR1"},
+	}
+
+	provider, _ := startProvider(t, config)
+	t.Cleanup(func() { _ = provider.Stop() })
+
+	// The first signal fails, it must be retried.
+	assertSignal(t, requests)
+	assertSignal(t, requests)
+
+	time.Sleep(200 * time.Millisecond)
+
+	select {
+	case req := <-requests:
+		t.Errorf("unexpected signal request: %+v", req)
+	default:
+	}
+}
+
+func TestProvider_SameDomainSeveralResolvers(t *testing.T) {
+	dir := t.TempDir()
+	acmePath := filepath.Join(dir, "acme.json")
+
+	shortLived := selfSigned(t, "example.com", time.Now().Add(24*time.Hour))
+	longLived := selfSigned(t, "example.com", time.Now().Add(90*24*time.Hour))
+
+	writeACMEContent(t, acmePath, map[string][]interface{}{
+		"a": {acmeEntry("example.com", nil, shortLived, keyV1)},
+		"b": {acmeEntry("example.com", nil, longLived, keyV2)},
+	})
+
+	config := certstorage.CreateConfig()
+	config.PollInterval = "50ms"
+	config.StoragePath = filepath.Join(dir, "certstorage.json")
+	config.ACMEStorage = acmePath
+
+	provider, cfgChan := startProvider(t, config)
+
+	waitConfig(t, cfgChan)
+
+	// The store must be stable: no new configuration is sent when nothing changed.
+	time.Sleep(250 * time.Millisecond)
+
+	if err := provider.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-cfgChan:
+		t.Error("unexpected configuration")
+	default:
+	}
+
+	store, err := certstorage.OpenStore(config.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := store.Get("example.com")
+	if rec == nil || rec.Resolver != "b" || rec.Certificate != longLived {
+		t.Fatalf("the certificate expiring last should be stored, got: %+v", rec)
 	}
 }
 

@@ -297,18 +297,18 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 		return fmt.Errorf("writing certificate: %w", err)
 	}
 
-	p.store.SetExportedFingerprint(svc.Name, rec.Fingerprint)
 	p.logger.Printf("Certificate for %s exported to %s", svc.Domain, svc.Path)
 
-	if svc.Container == "" || p.docker == nil {
-		return nil
+	if svc.Container != "" && p.docker != nil {
+		// The export is only recorded once the container is signaled, so a failed signal is retried on the next poll.
+		if err := p.docker.Signal(ctx, svc.Container, svc.Signal); err != nil {
+			return err
+		}
+
+		p.logger.Printf("Signal %s sent to container %s", svc.Signal, svc.Container)
 	}
 
-	if err := p.docker.Signal(ctx, svc.Container, svc.Signal); err != nil {
-		return err
-	}
-
-	p.logger.Printf("Signal %s sent to container %s", svc.Signal, svc.Container)
+	p.store.SetExportedFingerprint(svc.Name, rec.Fingerprint)
 
 	return nil
 }

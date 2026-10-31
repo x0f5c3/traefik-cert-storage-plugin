@@ -1,11 +1,15 @@
 package certstorage
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 )
 
 // acmeDomain mirrors the domain structure of Traefik's ACME storage.
@@ -44,11 +48,40 @@ func readACMEStorage(path string, resolvers []string) ([]*CertificateRecord, err
 	}
 
 	var records []*CertificateRecord
+	index := make(map[string]int)
+
 	for _, name := range resolverNames(content, resolvers) {
-		records = append(records, toRecords(name, content[name])...)
+		for _, rec := range toRecords(name, content[name]) {
+			// The same domain can be handled by several resolvers: keep the certificate expiring last.
+			key := strings.ToLower(rec.Main)
+			if i, ok := index[key]; ok {
+				if notAfter(rec.Certificate).After(notAfter(records[i].Certificate)) {
+					records[i] = rec
+				}
+				continue
+			}
+
+			index[key] = len(records)
+			records = append(records, rec)
+		}
 	}
 
 	return records, nil
+}
+
+// notAfter returns the expiration date of the first certificate of the PEM chain (zero if it cannot be parsed).
+func notAfter(chain string) time.Time {
+	block, _ := pem.Decode([]byte(chain))
+	if block == nil {
+		return time.Time{}
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return cert.NotAfter
 }
 
 // resolverNames returns the sorted names of the resolvers to import.

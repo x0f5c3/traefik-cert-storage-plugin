@@ -1,4 +1,4 @@
-module github.com/traefik/pluginproviderdemo
+module github.com/x0f5c3/traefik-cert-storage-plugin
 
 go 1.19
 

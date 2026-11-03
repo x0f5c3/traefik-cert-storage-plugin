@@ -287,9 +287,10 @@ func TestProvider_ConsulStorage(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	expected := "traefik-certstorage/certificates/example.com,traefik-certstorage/exports/web"
-	if got := strings.Join(consul.keys(), ","); got != expected {
-		t.Errorf("got keys %s, want %s", got, expected)
+	keys := consul.keys()
+	if len(keys) != 2 || keys[0] != "traefik-certstorage/certificates/example.com" ||
+		!strings.HasPrefix(keys[1], "traefik-certstorage/exports/web-") {
+		t.Errorf("unexpected Consul keys: %v", keys)
 	}
 
 	assertFile(t, filepath.Join(dir, "volume", "cert.pem"), certV1, 0o644)
@@ -405,6 +406,107 @@ func TestProvider_RefreshesRemoteCertificates(t *testing.T) {
 		t.Fatalf("published configuration did not contain the remote certificate update: %v", certificates[0])
 	}
 	assertFile(t, filepath.Join(dir, "volume", "cert.pem"), certV2, 0o644)
+}
+
+func TestProvider_DoesNotReplaceNewerRemoteCertificateWithACME(t *testing.T) {
+	dir := t.TempDir()
+	acmePath := filepath.Join(dir, "acme.json")
+	older := selfSigned(t, "example.com", time.Now().Add(24*time.Hour))
+	newer := selfSigned(t, "example.com", time.Now().Add(90*24*time.Hour))
+	writeACME(t, acmePath, older, keyV1)
+
+	storage := certstorage.StorageConfig{Type: "consul"}
+	_, consulURL := startFakeConsul(t, "", 0)
+	storage.Endpoint = consulURL
+	backend, err := certstorage.NewBackend(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := certstorage.NewStore(backend)
+	if err := seed.Load(); err != nil {
+		t.Fatal(err)
+	}
+	seed.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: newer, Key: keyV2})
+	if err := seed.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	config := certstorage.CreateConfig()
+	config.PollInterval = "50ms"
+	config.Storage = storage
+	config.ACMEStorage = acmePath
+	config.PublishCertificates = true
+	provider, cfgChan := startProvider(t, config)
+	t.Cleanup(func() { _ = provider.Stop() })
+
+	cfg := waitConfig(t, cfgChan)
+	certificates := publishedCertificates(t, cfg)
+	if len(certificates) != 1 {
+		t.Fatalf("got %d published certificates, want 1", len(certificates))
+	}
+	published, ok := certificates[0].(map[string]interface{})
+	if !ok || published["certFile"] != strings.TrimSpace(newer) {
+		t.Fatalf("published configuration did not retain the newer remote certificate: %v", certificates)
+	}
+
+	observer, err := certstorage.NewBackend(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded := certstorage.NewStore(observer)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if rec := reloaded.Get("example.com"); rec == nil || rec.Certificate != newer {
+		t.Errorf("the older ACME certificate replaced the newer remote certificate: %+v", rec)
+	}
+}
+
+func TestProvider_ExportAcknowledgementsAreScopedToTarget(t *testing.T) {
+	dir := t.TempDir()
+	consul, consulURL := startFakeConsul(t, "", 0)
+	failingEndpoint, failingRequests := startFakeDockerFailing(t, 1)
+	successfulEndpoint, successfulRequests := startFakeDocker(t)
+	volume := filepath.Join(dir, "volume")
+
+	config := certstorage.CreateConfig()
+	config.PollInterval = "1s"
+	config.Storage = certstorage.StorageConfig{Type: "consul", Endpoint: consulURL}
+	config.ACMEStorage = filepath.Join(dir, "acme.json")
+	writeACME(t, config.ACMEStorage, certV1, keyV1)
+
+	config.DockerEndpoint = failingEndpoint
+	config.Services = []certstorage.ServiceConfig{
+		{Name: "web", Domain: "example.com", Path: volume, Container: "web-1", Signal: "SIGUSR1"},
+	}
+	first, firstConfig := startProvider(t, config)
+	waitConfig(t, firstConfig)
+	assertSignal(t, failingRequests)
+	if err := first.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.DockerEndpoint = successfulEndpoint
+	config.Services[0].Container = "web-2"
+	second, secondConfig := startProvider(t, config)
+	waitConfig(t, secondConfig)
+	assertSignalTo(t, successfulRequests, "web-2")
+	if err := second.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.DockerEndpoint = failingEndpoint
+	config.Services[0].Container = "web-1"
+	restarted, restartedConfig := startProvider(t, config)
+	waitConfig(t, restartedConfig)
+	assertSignal(t, failingRequests)
+	if err := restarted.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(consul.keys()) == 0 {
+		t.Error("expected the providers to persist their shared certificate and export state")
+	}
 }
 
 func TestProvider_LetsEncryptFormat(t *testing.T) {

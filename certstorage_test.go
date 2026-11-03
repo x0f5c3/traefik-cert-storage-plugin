@@ -198,11 +198,15 @@ func waitConfig(t *testing.T, cfgChan chan json.Marshaler) map[string]interface{
 }
 
 func assertSignal(t *testing.T, requests chan signalRequest) {
+	assertSignalTo(t, requests, "web-1")
+}
+
+func assertSignalTo(t *testing.T, requests chan signalRequest, container string) {
 	t.Helper()
 
 	select {
 	case req := <-requests:
-		if req.method != http.MethodPost || req.path != "/containers/web-1/kill" || req.signal != "SIGUSR1" {
+		if req.method != http.MethodPost || req.path != "/containers/"+container+"/kill" || req.signal != "SIGUSR1" {
 			t.Errorf("unexpected signal request: %+v", req)
 		}
 	case <-time.After(5 * time.Second):
@@ -454,6 +458,36 @@ func TestProvider_ReexportMissingFiles(t *testing.T) {
 
 	assertFile(t, filepath.Join(volume, "tls.crt"), certV1, 0o644)
 	assertFile(t, filepath.Join(volume, "tls.key"), keyV1, 0o600)
+}
+
+func TestProvider_ExportWriteFailurePreservesExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	acmePath := filepath.Join(dir, "acme.json")
+	volume := filepath.Join(dir, "volume")
+	if err := os.MkdirAll(volume, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volume, "key.pem"), []byte(keyV1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volume, "not-a-directory"), []byte("blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeACME(t, acmePath, certV2, keyV2)
+
+	config := certstorage.CreateConfig()
+	config.PollInterval = "50ms"
+	config.Storage.Path = filepath.Join(dir, "certstorage.json")
+	config.ACMEStorage = acmePath
+	config.Services = []certstorage.ServiceConfig{
+		{Name: "web", Domain: "example.com", Path: volume, CertFile: "not-a-directory/cert.pem"},
+	}
+
+	provider, cfgChan := startProvider(t, config)
+	t.Cleanup(func() { _ = provider.Stop() })
+	waitConfig(t, cfgChan)
+
+	assertFile(t, filepath.Join(volume, "key.pem"), keyV1, 0o600)
 }
 
 func TestProvider_Init(t *testing.T) {

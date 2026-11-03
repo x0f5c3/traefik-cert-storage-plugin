@@ -373,9 +373,24 @@ func fingerprint(cert, key string) string {
 
 // writeFileAtomic writes data to a temporary file and renames it to path.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	tmpName, err := stageFile(path, data, perm)
 	if err != nil {
 		return err
+	}
+
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func stageFile(path string, data []byte, perm os.FileMode) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return "", err
 	}
 
 	tmpName := tmp.Name()
@@ -384,24 +399,19 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return err
+		return "", err
 	}
 
 	if err := tmp.Chmod(perm); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return err
+		return "", err
 	}
 
 	if err := tmp.Close(); err != nil {
 		cleanup()
-		return err
+		return "", err
 	}
 
-	if err := os.Rename(tmpName, path); err != nil {
-		cleanup()
-		return err
-	}
-
-	return nil
+	return tmpName, nil
 }

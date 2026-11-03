@@ -4,6 +4,8 @@ package certstorage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -296,6 +298,11 @@ func (p *Provider) importCertificates() bool {
 
 	var changed bool
 	for _, rec := range records {
+		if current := p.store.Get(rec.Main); current != nil &&
+			notAfter(rec.Certificate).Before(notAfter(current.Certificate)) {
+			continue
+		}
+
 		if p.store.Put(rec) {
 			p.logger.Printf("Certificate for %s stored", rec.Main)
 			changed = true
@@ -321,12 +328,13 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 
 	files := exportFiles(svc, rec)
 
-	if p.store.ExportedFingerprint(svc.Name) == rec.Fingerprint && filesExist(svc.Path, files) {
+	exportKey := exportKey(svc)
+	if p.store.ExportedFingerprint(exportKey) == rec.Fingerprint && filesExist(svc.Path, files) {
 		return nil
 	}
 
 	// Keep this export pending until the files are written and signaling succeeds.
-	p.store.SetExportedFingerprint(svc.Name, "")
+	p.store.SetExportedFingerprint(exportKey, "")
 
 	// The directory must be readable by the service, which may run as a different user.
 	if err := os.MkdirAll(svc.Path, 0o755); err != nil { //nolint:gosec // See above.
@@ -338,9 +346,10 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // Export directories must be readable by the service.
 			return fmt.Errorf("creating directory for %s: %w", file.name, err)
 		}
-		if err := writeFileAtomic(path, []byte(file.content), file.perm); err != nil {
-			return fmt.Errorf("writing %s: %w", file.name, err)
-		}
+	}
+
+	if err := writeExportFiles(svc.Path, files); err != nil {
+		return err
 	}
 
 	p.logger.Printf("Certificate for %s exported to %s", svc.Domain, svc.Path)
@@ -354,7 +363,136 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 		p.logger.Printf("Signal %s sent to container %s", svc.Signal, svc.Container)
 	}
 
-	p.store.SetExportedFingerprint(svc.Name, rec.Fingerprint)
+	p.store.SetExportedFingerprint(exportKey, rec.Fingerprint)
+
+	return nil
+}
+
+func exportKey(svc ServiceConfig) string {
+	target := sha256.Sum256([]byte(svc.Path + "\x00" + svc.Container))
+
+	return svc.Name + "-" + hex.EncodeToString(target[:])
+}
+
+func writeExportFiles(dir string, files []exportFile) error {
+	type replacement struct {
+		path      string
+		temp      string
+		backup    string
+		exists    bool
+		hadFile   bool
+		installed bool
+	}
+
+	replacements := make([]replacement, len(files))
+	committed := false
+	cleanup := func() {
+		for _, replacement := range replacements {
+			if replacement.temp != "" {
+				_ = os.Remove(replacement.temp)
+			}
+			if replacement.backup != "" && (committed || !replacement.hadFile) {
+				_ = os.Remove(replacement.backup)
+			}
+		}
+	}
+	defer cleanup()
+
+	for i, file := range files {
+		path := filepath.Join(dir, file.name)
+		temp, err := stageFile(path, []byte(file.content), file.perm)
+		if err != nil {
+			return fmt.Errorf("staging %s: %w", file.name, err)
+		}
+
+		replacements[i] = replacement{path: path, temp: temp}
+	}
+
+	for i := range replacements {
+		entry := &replacements[i]
+		info, err := os.Lstat(entry.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("checking %s: %w", filepath.Base(entry.path), err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("replacing %s: destination is a directory", filepath.Base(entry.path))
+		}
+		entry.exists = true
+	}
+
+	for i := range replacements {
+		entry := &replacements[i]
+		if !entry.exists {
+			continue
+		}
+
+		backup, err := os.CreateTemp(filepath.Dir(entry.path), "."+filepath.Base(entry.path)+".backup-*")
+		if err != nil {
+			return fmt.Errorf("backing up %s: %w", filepath.Base(entry.path), err)
+		}
+		entry.backup = backup.Name()
+		if err := backup.Close(); err != nil {
+			return fmt.Errorf("backing up %s: %w", filepath.Base(entry.path), err)
+		}
+		if err := os.Remove(entry.backup); err != nil {
+			return fmt.Errorf("backing up %s: %w", filepath.Base(entry.path), err)
+		}
+	}
+
+	rollback := func() error {
+		var rollbackErr error
+		for i := len(replacements) - 1; i >= 0; i-- {
+			entry := &replacements[i]
+			if entry.installed {
+				if err := os.Remove(entry.path); err != nil && rollbackErr == nil {
+					rollbackErr = err
+				}
+			}
+			if entry.hadFile {
+				if err := os.Rename(entry.backup, entry.path); err != nil && rollbackErr == nil {
+					rollbackErr = err
+				} else {
+					entry.backup = ""
+					entry.hadFile = false
+				}
+			}
+		}
+
+		return rollbackErr
+	}
+
+	for i := range replacements {
+		entry := &replacements[i]
+		if !entry.exists {
+			continue
+		}
+		if err := os.Rename(entry.path, entry.backup); err != nil {
+			if rollbackErr := rollback(); rollbackErr != nil {
+				return fmt.Errorf("backing up %s: %v (rollback failed: %v)", filepath.Base(entry.path), err, rollbackErr)
+			}
+
+			return fmt.Errorf("backing up %s: %w", filepath.Base(entry.path), err)
+		}
+		entry.hadFile = true
+	}
+
+	for i := range replacements {
+		entry := &replacements[i]
+		if err := os.Rename(entry.temp, entry.path); err != nil {
+			if rollbackErr := rollback(); rollbackErr != nil {
+				return fmt.Errorf("installing %s: %v (rollback failed: %v)", filepath.Base(entry.path), err, rollbackErr)
+			}
+
+			return fmt.Errorf("installing %s: %w", filepath.Base(entry.path), err)
+		}
+		entry.temp = ""
+		entry.installed = true
+	}
+
+	committed = true
 
 	return nil
 }

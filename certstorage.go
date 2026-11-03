@@ -374,40 +374,63 @@ func exportKey(svc ServiceConfig) string {
 	return svc.Name + "-" + hex.EncodeToString(target[:])
 }
 
+type exportReplacement struct {
+	path      string
+	temp      string
+	backup    string
+	exists    bool
+	hadFile   bool
+	installed bool
+}
+
 func writeExportFiles(dir string, files []exportFile) error {
-	type replacement struct {
-		path      string
-		temp      string
-		backup    string
-		exists    bool
-		hadFile   bool
-		installed bool
+	replacements, err := stageExportFiles(dir, files)
+	if err != nil {
+		return err
 	}
-
-	replacements := make([]replacement, len(files))
 	committed := false
-	cleanup := func() {
-		for _, replacement := range replacements {
-			if replacement.temp != "" {
-				_ = os.Remove(replacement.temp)
-			}
-			if replacement.backup != "" && (committed || !replacement.hadFile) {
-				_ = os.Remove(replacement.backup)
-			}
-		}
-	}
-	defer cleanup()
+	defer cleanupExportFiles(replacements, &committed)
 
+	if err := backupExportFiles(replacements); err != nil {
+		return err
+	}
+	if err := installExportFiles(replacements); err != nil {
+		return err
+	}
+
+	committed = true
+
+	return nil
+}
+
+func stageExportFiles(dir string, files []exportFile) ([]exportReplacement, error) {
+	replacements := make([]exportReplacement, len(files))
 	for i, file := range files {
 		path := filepath.Join(dir, file.name)
 		temp, err := stageFile(path, []byte(file.content), file.perm)
 		if err != nil {
-			return fmt.Errorf("staging %s: %w", file.name, err)
+			cleanupExportFiles(replacements, nil)
+			return nil, fmt.Errorf("staging %s: %w", file.name, err)
 		}
 
-		replacements[i] = replacement{path: path, temp: temp}
+		replacements[i] = exportReplacement{path: path, temp: temp}
 	}
 
+	return replacements, nil
+}
+
+func backupExportFiles(replacements []exportReplacement) error {
+	if err := inspectExportFiles(replacements); err != nil {
+		return err
+	}
+	if err := prepareExportBackups(replacements); err != nil {
+		return err
+	}
+
+	return moveExportBackups(replacements)
+}
+
+func inspectExportFiles(replacements []exportReplacement) error {
 	for i := range replacements {
 		entry := &replacements[i]
 		info, err := os.Lstat(entry.path)
@@ -423,6 +446,10 @@ func writeExportFiles(dir string, files []exportFile) error {
 		entry.exists = true
 	}
 
+	return nil
+}
+
+func prepareExportBackups(replacements []exportReplacement) error {
 	for i := range replacements {
 		entry := &replacements[i]
 		if !entry.exists {
@@ -442,35 +469,17 @@ func writeExportFiles(dir string, files []exportFile) error {
 		}
 	}
 
-	rollback := func() error {
-		var rollbackErr error
-		for i := len(replacements) - 1; i >= 0; i-- {
-			entry := &replacements[i]
-			if entry.installed {
-				if err := os.Remove(entry.path); err != nil && rollbackErr == nil {
-					rollbackErr = err
-				}
-			}
-			if entry.hadFile {
-				if err := os.Rename(entry.backup, entry.path); err != nil && rollbackErr == nil {
-					rollbackErr = err
-				} else {
-					entry.backup = ""
-					entry.hadFile = false
-				}
-			}
-		}
+	return nil
+}
 
-		return rollbackErr
-	}
-
+func moveExportBackups(replacements []exportReplacement) error {
 	for i := range replacements {
 		entry := &replacements[i]
 		if !entry.exists {
 			continue
 		}
 		if err := os.Rename(entry.path, entry.backup); err != nil {
-			if rollbackErr := rollback(); rollbackErr != nil {
+			if rollbackErr := rollbackExportFiles(replacements); rollbackErr != nil {
 				return fmt.Errorf("backing up %s: %v (rollback failed: %v)", filepath.Base(entry.path), err, rollbackErr)
 			}
 
@@ -479,10 +488,14 @@ func writeExportFiles(dir string, files []exportFile) error {
 		entry.hadFile = true
 	}
 
+	return nil
+}
+
+func installExportFiles(replacements []exportReplacement) error {
 	for i := range replacements {
 		entry := &replacements[i]
 		if err := os.Rename(entry.temp, entry.path); err != nil {
-			if rollbackErr := rollback(); rollbackErr != nil {
+			if rollbackErr := rollbackExportFiles(replacements); rollbackErr != nil {
 				return fmt.Errorf("installing %s: %v (rollback failed: %v)", filepath.Base(entry.path), err, rollbackErr)
 			}
 
@@ -492,9 +505,40 @@ func writeExportFiles(dir string, files []exportFile) error {
 		entry.installed = true
 	}
 
-	committed = true
-
 	return nil
+}
+
+func rollbackExportFiles(replacements []exportReplacement) error {
+	var rollbackErr error
+	for i := len(replacements) - 1; i >= 0; i-- {
+		entry := &replacements[i]
+		if entry.installed {
+			if err := os.Remove(entry.path); err != nil && rollbackErr == nil {
+				rollbackErr = err
+			}
+		}
+		if entry.hadFile {
+			if err := os.Rename(entry.backup, entry.path); err != nil && rollbackErr == nil {
+				rollbackErr = err
+			} else {
+				entry.backup = ""
+				entry.hadFile = false
+			}
+		}
+	}
+
+	return rollbackErr
+}
+
+func cleanupExportFiles(replacements []exportReplacement, committed *bool) {
+	for _, entry := range replacements {
+		if entry.temp != "" {
+			_ = os.Remove(entry.temp)
+		}
+		if entry.backup != "" && (committed != nil && *committed || !entry.hadFile) {
+			_ = os.Remove(entry.backup)
+		}
+	}
 }
 
 // Stop to stop the provider and the related go routines.

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -460,6 +461,63 @@ func TestProvider_ReexportMissingFiles(t *testing.T) {
 	assertFile(t, filepath.Join(volume, "tls.key"), keyV1, 0o600)
 }
 
+func TestProvider_PreservesConfiguredExportOwnershipOnRenewal(t *testing.T) {
+	if syscall.Geteuid() != 0 {
+		t.Skip("changing file ownership requires root")
+	}
+
+	dir := t.TempDir()
+	acmePath := filepath.Join(dir, "acme.json")
+	volume := filepath.Join(dir, "volume")
+	writeACME(t, acmePath, certV1, keyV1)
+
+	uid, gid := 65534, 65534
+	config := certstorage.CreateConfig()
+	config.PollInterval = "50ms"
+	config.Storage.Path = filepath.Join(dir, "certstorage.json")
+	config.ACMEStorage = acmePath
+	config.Services = []certstorage.ServiceConfig{
+		{Name: "web", Domain: "example.com", Path: volume, UID: &uid, GID: &gid},
+	}
+
+	provider, cfgChan := startProvider(t, config)
+	t.Cleanup(func() { _ = provider.Stop() })
+	waitConfig(t, cfgChan)
+	assertExportOwner(t, filepath.Join(volume, "cert.pem"), uint32(uid), uint32(gid))
+	assertExportOwner(t, filepath.Join(volume, "key.pem"), uint32(uid), uint32(gid))
+
+	writeACME(t, acmePath, certV2, keyV2)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cert, err := os.ReadFile(filepath.Join(volume, "cert.pem"))
+		if err == nil && string(cert) == certV2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for the renewed certificate export")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	assertExportOwner(t, filepath.Join(volume, "cert.pem"), uint32(uid), uint32(gid))
+	assertExportOwner(t, filepath.Join(volume, "key.pem"), uint32(uid), uint32(gid))
+}
+
+func assertExportOwner(t *testing.T, path string, uid, gid uint32) {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("unexpected file metadata for %s", path)
+	}
+	if stat.Uid != uid || stat.Gid != gid {
+		t.Errorf("%s owner = %d:%d, want %d:%d", path, stat.Uid, stat.Gid, uid, gid)
+	}
+}
+
 func TestProvider_ExportWriteFailurePreservesExistingFiles(t *testing.T) {
 	dir := t.TempDir()
 	acmePath := filepath.Join(dir, "acme.json")
@@ -492,6 +550,7 @@ func TestProvider_ExportWriteFailurePreservesExistingFiles(t *testing.T) {
 
 func TestProvider_Init(t *testing.T) {
 	dir := t.TempDir()
+	uid, negativeGID := 1000, -1
 
 	testCases := []struct {
 		desc     string
@@ -550,6 +609,18 @@ func TestProvider_Init(t *testing.T) {
 			desc:     "unsupported format",
 			storage:  filepath.Join(dir, "h.json"),
 			services: []certstorage.ServiceConfig{{Name: "a", Domain: "example.com", Path: dir, Format: "pkcs12"}},
+			wantErr:  true,
+		},
+		{
+			desc:     "incomplete export owner",
+			storage:  filepath.Join(dir, "l.json"),
+			services: []certstorage.ServiceConfig{{Name: "a", Domain: "example.com", Path: dir, UID: &uid}},
+			wantErr:  true,
+		},
+		{
+			desc:     "negative export owner",
+			storage:  filepath.Join(dir, "m.json"),
+			services: []certstorage.ServiceConfig{{Name: "a", Domain: "example.com", Path: dir, UID: &uid, GID: &negativeGID}},
 			wantErr:  true,
 		},
 		{

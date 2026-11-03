@@ -18,6 +18,8 @@ type exportFile struct {
 	name    string
 	content string
 	perm    os.FileMode
+	uid     *int
+	gid     *int
 }
 
 // exportFiles returns the files to write for svc.

@@ -52,6 +52,8 @@ providers:
       # Docker Engine API endpoint used to signal containers (default: unix:///var/run/docker.sock).
       # Supported schemes: unix://, tcp://, http://, https://.
       dockerEndpoint: unix:///var/run/docker.sock
+      # Stable identity for this exporter (defaults to the host name).
+      exporterID: traefik-host-1
       # Services requesting a certificate.
       services:
         - name: mail
@@ -68,6 +70,9 @@ providers:
           container: mailserver
           # Signal sent to the container (default: SIGHUP).
           signal: SIGHUP
+          # Owner for files when first created (existing file ownership is preserved).
+          uid: 1000
+          gid: 1000
 ```
 
 ### Storage backends
@@ -115,6 +120,7 @@ Services expecting certbot's layout can mount the volume so `path` matches their
 Notes:
 
 - Certificates are written with `0644` permissions, private keys with `0600` permissions.
+- Existing export file ownership is preserved on renewal. Set both `uid` and `gid` when first-created files must be owned by a different user; the Traefik process must have permission to apply that ownership.
 - A service is exported (and its container signaled) only when its certificate changed since the last export (the fingerprint of the last exported certificate is persisted in the store), or when the exported files are missing.
 - The certificates stay in the store even if they disappear from the ACME storage.
 - Signaling containers requires access to the Docker Engine API, e.g. by mounting `/var/run/docker.sock` into the Traefik container.

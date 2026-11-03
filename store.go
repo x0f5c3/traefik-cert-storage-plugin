@@ -123,6 +123,14 @@ func (s *Store) Refresh() (bool, error) {
 	changed := false
 	for key, current := range s.data.Certificates {
 		if s.dirty[certificatesPrefix+key] {
+			remote, ok := data.Certificates[key]
+			if ok && notAfter(remote.Certificate).After(notAfter(current.Certificate)) {
+				if !reflect.DeepEqual(current, remote) {
+					changed = true
+				}
+				s.data.Certificates[key] = remote
+				delete(s.dirty, certificatesPrefix+key)
+			}
 			continue
 		}
 

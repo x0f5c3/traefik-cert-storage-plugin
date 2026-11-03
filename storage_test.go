@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -36,6 +37,20 @@ type fakeConsul struct {
 	kv       map[string][]byte
 	token    string
 	failures int
+}
+
+type failingStoreBackend struct {
+	certstorage.Backend
+	failNext bool
+}
+
+func (b *failingStoreBackend) Store(entries map[string][]byte) error {
+	if b.failNext {
+		b.failNext = false
+		return errors.New("temporary store failure")
+	}
+
+	return b.Backend.Store(entries)
 }
 
 func startFakeConsul(t *testing.T, token string, failures int) (*fakeConsul, string) {
@@ -353,6 +368,62 @@ func TestStore_RefreshPreservesDirtyEntries(t *testing.T) {
 	}
 }
 
+func TestStore_RefreshSupersedesDirtyCertificateWithNewerRemote(t *testing.T) {
+	_, consulURL := startFakeConsul(t, "", 0)
+	backend, err := certstorage.NewBackend(certstorage.StorageConfig{Type: "consul", Endpoint: consulURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localBackend := &failingStoreBackend{Backend: backend}
+
+	localCert := selfSigned(t, "example.com", time.Now().Add(48*time.Hour))
+	remoteCert := selfSigned(t, "example.com", time.Now().Add(72*time.Hour))
+	store := certstorage.NewStore(localBackend)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: selfSigned(t, "example.com", time.Now().Add(24*time.Hour)), Key: keyV1})
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+	store.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: localCert, Key: keyV2})
+	localBackend.failNext = true
+	if err := store.Save(); err == nil {
+		t.Fatal("expected the local write to fail")
+	}
+
+	remoteStore := certstorage.NewStore(backend)
+	if err := remoteStore.Load(); err != nil {
+		t.Fatal(err)
+	}
+	remoteStore.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: remoteCert, Key: keyV1})
+	if err := remoteStore.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := store.Refresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("refresh should report the newer remote certificate")
+	}
+	if rec := store.Get("example.com"); rec == nil || rec.Certificate != remoteCert {
+		t.Fatalf("newer remote certificate did not replace the dirty local record: %+v", rec)
+	}
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := certstorage.NewStore(backend)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if rec := reloaded.Get("example.com"); rec == nil || rec.Certificate != remoteCert {
+		t.Fatalf("save overwrote the newer remote certificate: %+v", rec)
+	}
+}
+
 func TestProvider_RefreshesRemoteCertificates(t *testing.T) {
 	dir := t.TempDir()
 	_, consulURL := startFakeConsul(t, "", 0)
@@ -406,6 +477,50 @@ func TestProvider_RefreshesRemoteCertificates(t *testing.T) {
 		t.Fatalf("published configuration did not contain the remote certificate update: %v", certificates[0])
 	}
 	assertFile(t, filepath.Join(dir, "volume", "cert.pem"), certV2, 0o644)
+}
+
+func TestProvider_ExportAcknowledgementsAreExporterScoped(t *testing.T) {
+	dir := t.TempDir()
+	_, consulURL := startFakeConsul(t, "", 0)
+	backend, err := certstorage.NewBackend(certstorage.StorageConfig{Type: "consul", Endpoint: consulURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := certstorage.NewStore(backend)
+	if err := seed.Load(); err != nil {
+		t.Fatal(err)
+	}
+	seed.Put(&certstorage.CertificateRecord{Main: "example.com", Certificate: certV1, Key: keyV1})
+	if err := seed.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	endpointA, requestsA := startFakeDocker(t)
+	endpointB, requestsB := startFakeDocker(t)
+	service := certstorage.ServiceConfig{
+		Name: "web", Domain: "example.com", Path: filepath.Join(dir, "volume"), Container: "web-1", Signal: "SIGUSR1",
+	}
+
+	run := func(exporterID, endpoint string, requests chan signalRequest) {
+		t.Helper()
+		config := certstorage.CreateConfig()
+		config.PollInterval = "50ms"
+		config.Storage = certstorage.StorageConfig{Type: "consul", Endpoint: consulURL}
+		config.ExporterID = exporterID
+		config.DockerEndpoint = endpoint
+		config.Services = []certstorage.ServiceConfig{service}
+
+		provider, cfgChan := startProvider(t, config)
+		waitConfig(t, cfgChan)
+		assertSignal(t, requests)
+		if err := provider.Stop(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run("host-a", endpointA, requestsA)
+	run("host-b", endpointA, requestsA)
+	run("host-a", endpointB, requestsB)
 }
 
 func TestProvider_DoesNotReplaceNewerRemoteCertificateWithACME(t *testing.T) {

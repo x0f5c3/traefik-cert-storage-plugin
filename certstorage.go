@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/traefik/genconf/dynamic"
@@ -52,6 +53,9 @@ type ServiceConfig struct {
 	Container string `json:"container,omitempty"`
 	// Signal is the signal sent to the container (default: SIGHUP).
 	Signal string `json:"signal,omitempty"`
+	// UID and GID set ownership for newly created export files.
+	UID *int `json:"uid,omitempty"`
+	GID *int `json:"gid,omitempty"`
 }
 
 // Config the plugin configuration.
@@ -68,6 +72,8 @@ type Config struct {
 	PublishCertificates bool `json:"publishCertificates,omitempty"`
 	// DockerEndpoint is the Docker Engine API endpoint used to signal containers.
 	DockerEndpoint string `json:"dockerEndpoint,omitempty"`
+	// ExporterID distinguishes this provider from other exporters sharing a store.
+	ExporterID string `json:"exporterID,omitempty"`
 	// Services are the services requesting certificates.
 	Services []ServiceConfig `json:"services,omitempty"`
 }
@@ -92,6 +98,7 @@ type Provider struct {
 
 	pollInterval time.Duration
 	services     []ServiceConfig
+	exporterID   string
 
 	store  *Store
 	docker *dockerClient
@@ -109,6 +116,14 @@ func New(_ context.Context, config *Config, name string) (*Provider, error) {
 	pi, err := time.ParseDuration(config.PollInterval)
 	if err != nil {
 		return nil, fmt.Errorf("invalid poll interval: %w", err)
+	}
+
+	exporterID := strings.TrimSpace(config.ExporterID)
+	if exporterID == "" {
+		exporterID, err = os.Hostname()
+		if err != nil {
+			return nil, fmt.Errorf("getting exporter identity: %w", err)
+		}
 	}
 
 	services := make([]ServiceConfig, 0, len(config.Services))
@@ -134,6 +149,7 @@ func New(_ context.Context, config *Config, name string) (*Provider, error) {
 		logger:       log.New(os.Stdout, "[certstorage:"+name+"] ", log.LstdFlags),
 		pollInterval: pi,
 		services:     services,
+		exporterID:   exporterID,
 	}, nil
 }
 
@@ -185,6 +201,9 @@ func (p *Provider) validateServices() error {
 		}
 		if svc.Path == "" {
 			return fmt.Errorf("service %q: path is required", svc.Name)
+		}
+		if (svc.UID == nil) != (svc.GID == nil) || svc.UID != nil && (*svc.UID < 0 || *svc.GID < 0) {
+			return fmt.Errorf("service %q: uid and gid must both be non-negative", svc.Name)
 		}
 		switch svc.Format {
 		case FormatPEM:
@@ -327,8 +346,12 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 	}
 
 	files := exportFiles(svc, rec)
+	for i := range files {
+		files[i].uid = svc.UID
+		files[i].gid = svc.GID
+	}
 
-	exportKey := exportKey(svc)
+	exportKey := exportKey(svc, p.exporterID, p.config.DockerEndpoint)
 	if p.store.ExportedFingerprint(exportKey) == rec.Fingerprint && filesExist(svc.Path, files) {
 		return nil
 	}
@@ -368,8 +391,11 @@ func (p *Provider) exportService(ctx context.Context, svc ServiceConfig) error {
 	return nil
 }
 
-func exportKey(svc ServiceConfig) string {
-	target := sha256.Sum256([]byte(svc.Path + "\x00" + svc.Container))
+func exportKey(svc ServiceConfig, exporterID, dockerEndpoint string) string {
+	if dockerEndpoint == "" {
+		dockerEndpoint = DefaultDockerEndpoint
+	}
+	target := sha256.Sum256([]byte(exporterID + "\x00" + dockerEndpoint + "\x00" + svc.Path + "\x00" + svc.Container))
 
 	return svc.Name + "-" + hex.EncodeToString(target[:])
 }
@@ -407,10 +433,38 @@ func stageExportFiles(dir string, files []exportFile) ([]exportReplacement, erro
 	replacements := make([]exportReplacement, len(files))
 	for i, file := range files {
 		path := filepath.Join(dir, file.name)
+		uid, gid, setOwner := 0, 0, false
+		info, statErr := os.Lstat(path)
+		if statErr == nil {
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				cleanupExportFiles(replacements, nil)
+				return nil, fmt.Errorf("checking ownership of %s: unsupported file metadata", file.name)
+			}
+			uid, gid, setOwner = int(stat.Uid), int(stat.Gid), true
+		} else if !os.IsNotExist(statErr) {
+			cleanupExportFiles(replacements, nil)
+			return nil, fmt.Errorf("checking ownership of %s: %w", file.name, statErr)
+		} else if file.uid != nil {
+			uid, gid, setOwner = *file.uid, *file.gid, true
+		}
+
 		temp, err := stageFile(path, []byte(file.content), file.perm)
 		if err != nil {
 			cleanupExportFiles(replacements, nil)
 			return nil, fmt.Errorf("staging %s: %w", file.name, err)
+		}
+		if setOwner {
+			if err := os.Chown(temp, uid, gid); err != nil {
+				_ = os.Remove(temp)
+				cleanupExportFiles(replacements, nil)
+				return nil, fmt.Errorf("setting ownership of %s: %w", file.name, err)
+			}
+			if err := os.Chmod(temp, file.perm); err != nil {
+				_ = os.Remove(temp)
+				cleanupExportFiles(replacements, nil)
+				return nil, fmt.Errorf("setting permissions of %s: %w", file.name, err)
+			}
 		}
 
 		replacements[i] = exportReplacement{path: path, temp: temp}
@@ -424,10 +478,13 @@ func backupExportFiles(replacements []exportReplacement) error {
 		return err
 	}
 	if err := prepareExportBackups(replacements); err != nil {
+		if rollbackErr := rollbackExportFiles(replacements); rollbackErr != nil {
+			return fmt.Errorf("%v (rollback failed: %v)", err, rollbackErr)
+		}
 		return err
 	}
 
-	return moveExportBackups(replacements)
+	return nil
 }
 
 func inspectExportFiles(replacements []exportReplacement) error {
@@ -467,22 +524,7 @@ func prepareExportBackups(replacements []exportReplacement) error {
 		if err := os.Remove(entry.backup); err != nil {
 			return fmt.Errorf("backing up %s: %w", filepath.Base(entry.path), err)
 		}
-	}
-
-	return nil
-}
-
-func moveExportBackups(replacements []exportReplacement) error {
-	for i := range replacements {
-		entry := &replacements[i]
-		if !entry.exists {
-			continue
-		}
-		if err := os.Rename(entry.path, entry.backup); err != nil {
-			if rollbackErr := rollbackExportFiles(replacements); rollbackErr != nil {
-				return fmt.Errorf("backing up %s: %v (rollback failed: %v)", filepath.Base(entry.path), err, rollbackErr)
-			}
-
+		if err := os.Link(entry.path, entry.backup); err != nil {
 			return fmt.Errorf("backing up %s: %w", filepath.Base(entry.path), err)
 		}
 		entry.hadFile = true
@@ -513,13 +555,17 @@ func rollbackExportFiles(replacements []exportReplacement) error {
 	for i := len(replacements) - 1; i >= 0; i-- {
 		entry := &replacements[i]
 		if entry.installed {
-			if err := os.Remove(entry.path); err != nil && rollbackErr == nil {
-				rollbackErr = err
+			if !entry.hadFile {
+				if err := os.Remove(entry.path); err != nil && rollbackErr == nil {
+					rollbackErr = err
+				}
 			}
 		}
 		if entry.hadFile {
-			if err := os.Rename(entry.backup, entry.path); err != nil && rollbackErr == nil {
-				rollbackErr = err
+			if err := os.Rename(entry.backup, entry.path); err != nil {
+				if rollbackErr == nil {
+					rollbackErr = err
+				}
 			} else {
 				entry.backup = ""
 				entry.hadFile = false

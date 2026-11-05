@@ -562,7 +562,16 @@ func rollbackExportFiles(replacements []exportReplacement) error {
 			}
 		}
 		if entry.hadFile {
-			if err := os.Rename(entry.backup, entry.path); err != nil {
+			if entry.installed {
+				if err := os.Rename(entry.backup, entry.path); err != nil {
+					if rollbackErr == nil {
+						rollbackErr = err
+					}
+				} else {
+					entry.backup = ""
+					entry.hadFile = false
+				}
+			} else if err := os.Remove(entry.backup); err != nil {
 				if rollbackErr == nil {
 					rollbackErr = err
 				}
@@ -581,7 +590,7 @@ func cleanupExportFiles(replacements []exportReplacement, committed *bool) {
 		if entry.temp != "" {
 			_ = os.Remove(entry.temp)
 		}
-		if entry.backup != "" && (committed != nil && *committed || !entry.hadFile) {
+		if entry.backup != "" && (committed != nil && *committed || !entry.installed) {
 			_ = os.Remove(entry.backup)
 		}
 	}

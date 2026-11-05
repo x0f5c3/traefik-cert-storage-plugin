@@ -1,10 +1,15 @@
-displayName: Provider Plugin Demo
+displayName: Certificate Storage
 type: provider
 iconPath: .assets/icon.png
 
-import: github.com/traefik/pluginproviderdemo
+import: github.com/x0f5c3/traefik-cert-storage-plugin
+basePkg: certstorage
 
-summary: '[Demo] Simple Provider Plugin'
+summary: 'Persists certificates in an embedded store, exports them to the services requesting them and signals their containers on renewal.'
 
 testData:
-  pollInterval: 5s
+  pollInterval: 10s
+  storage:
+    type: file
+    path: /tmp/certstorage/certstorage.json
+  acmeStorage: /tmp/certstorage/acme.json
